@@ -1,6 +1,8 @@
+import importlib.util
 import json
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -21,11 +23,41 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 AGENT_NAME = (
-    os.getenv("DYNAMIC_AGENT_NAME")
-    or os.getenv("AGENT_NAME")
+    os.getenv("AGENT_NAME")
     or os.getenv("LIVEKIT_AGENT_NAME")
-    or "dynamic-agent"
+    or os.getenv("DYNAMIC_AGENT_NAME")
+    or "my-agent"
 )
+DEFAULT_PROMPT_PROFILE = "main"
+DYNAMIC_PROMPT_PROFILE = "dynamic"
+_MAIN_PROMPT_ASSISTANT_CLASS: type[Agent] | None = None
+
+
+def _load_main_prompt_assistant_class() -> type[Agent] | None:
+    global _MAIN_PROMPT_ASSISTANT_CLASS
+    if _MAIN_PROMPT_ASSISTANT_CLASS is not None:
+        return _MAIN_PROMPT_ASSISTANT_CLASS
+
+    module_path = Path(__file__).resolve().with_name("agent.py")
+    spec = importlib.util.spec_from_file_location("main_prompt_agent", module_path)
+    if spec is None or spec.loader is None:
+        logger.warning("Unable to load main prompt assistant from %s", module_path)
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        logger.exception("Failed to import main prompt assistant from %s", module_path)
+        return None
+
+    assistant_class = getattr(module, "Assistant", None)
+    if assistant_class is None:
+        logger.warning("Assistant class not found in %s", module_path)
+        return None
+
+    _MAIN_PROMPT_ASSISTANT_CLASS = assistant_class
+    return _MAIN_PROMPT_ASSISTANT_CLASS
 
 
 class Assistant(Agent):
@@ -428,7 +460,7 @@ Positioning power over process.
     #     return "sunny with a temperature of 70 degrees."
 
 
-server = AgentServer()
+server = AgentServer(num_idle_processes=0)
 
 
 def prewarm(proc: JobProcess):
@@ -438,33 +470,52 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
-def get_resume_from_job_metadata(ctx: JobContext) -> str:
+def get_job_metadata(ctx: JobContext) -> dict:
     if not ctx.job.metadata:
-        return ""
+        return {}
 
     try:
         metadata = json.loads(ctx.job.metadata)
     except json.JSONDecodeError:
-        logger.warning("Job metadata is not valid JSON. Ignoring resume payload.")
-        return ""
+        logger.warning("Job metadata is not valid JSON. Ignoring metadata payload.")
+        return {}
 
     if not isinstance(metadata, dict):
-        logger.warning("Job metadata is not an object. Ignoring resume payload.")
-        return ""
+        logger.warning("Job metadata is not an object. Ignoring metadata payload.")
+        return {}
 
+    return metadata
+
+
+def get_resume_from_metadata(metadata: dict) -> str:
     resume = metadata.get("resume", "")
     return resume if isinstance(resume, str) else str(resume)
 
 
+def get_prompt_profile_from_metadata(metadata: dict) -> str:
+    profile = metadata.get("prompt_profile", DEFAULT_PROMPT_PROFILE)
+    if not isinstance(profile, str):
+        profile = str(profile)
+
+    normalized = profile.strip().lower()
+    if normalized == DYNAMIC_PROMPT_PROFILE:
+        return DYNAMIC_PROMPT_PROFILE
+
+    return DEFAULT_PROMPT_PROFILE
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: JobContext):
-    resume = get_resume_from_job_metadata(ctx)
+    metadata = get_job_metadata(ctx)
+    resume = get_resume_from_metadata(metadata)
+    prompt_profile = get_prompt_profile_from_metadata(metadata)
 
     # Logging setup
     # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
         "resume_metadata_present": bool(resume),
+        "prompt_profile": prompt_profile,
     }
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
@@ -510,8 +561,21 @@ async def my_agent(ctx: JobContext):
     # await avatar.start(session, room=ctx.room)
 
     # Start the session, which initializes the voice pipeline and warms up the models
+    selected_assistant: Agent
+    if prompt_profile == DYNAMIC_PROMPT_PROFILE:
+        selected_assistant = Assistant(resume=resume)
+    else:
+        main_prompt_assistant_class = _load_main_prompt_assistant_class()
+        if main_prompt_assistant_class is None:
+            logger.warning(
+                "Falling back to dynamic prompt because main prompt assistant could not be loaded."
+            )
+            selected_assistant = Assistant(resume=resume)
+        else:
+            selected_assistant = main_prompt_assistant_class(resume=resume)
+
     await session.start(
-        agent=Assistant(resume=resume),
+        agent=selected_assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
