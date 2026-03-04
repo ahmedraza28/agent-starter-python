@@ -1,0 +1,40 @@
+envVarGroups:
+  - name: livekit-agent-secrets
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+services:
+  - type: worker
+    name: candidate-main-agent
+    runtime: docker
+    plan: starter
+    region: singapore
+    branch: Ahmed
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: uv run src/agent.py start
+    envVars:
+      - fromGroup: livekit-agent-secrets
+      - key: AGENT_NAME
+        value: my-agent
+
+  - type: worker
+    name: candidate-dynamic-agent
+    runtime: docker
+    plan: starter
+    region: singapore
+    branch: Ahmed
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: uv run src/dynamic-agent.py start
+    envVars:
+      - fromGroup: livekit-agent-secrets
+      - key: DYNAMIC_AGENT_NAME
+        value: dynamic-agent
