@@ -396,6 +396,7 @@ async def my_agent(ctx: JobContext):
 
     # Join the room and connect to the user
     await ctx.connect()
+    await session.generate_reply(instructions="Greet the user and offer your assistance.")
 
 
 if __name__ == "__main__":
