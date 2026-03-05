@@ -30,7 +30,27 @@ def _is_env_enabled(name: str, default: bool) -> bool:
     return value.strip().lower() in _TRUE_VALUES
 
 
-ENABLE_TURN_DETECTOR = _is_env_enabled("ENABLE_TURN_DETECTOR", default=False)
+def _get_turn_detector_mode() -> str:
+    mode = os.getenv("TURN_DETECTOR_MODE")
+    if mode:
+        normalized = mode.strip().lower()
+        if normalized in {"off", "none", "disabled"}:
+            return "off"
+        if normalized in {"english", "en"}:
+            return "english"
+        if normalized in {"multilingual", "multi"}:
+            return "multilingual"
+        if normalized == "stt":
+            return "stt"
+        logger.warning(
+            "Unknown TURN_DETECTOR_MODE=%s. Falling back to ENABLE_TURN_DETECTOR behavior.",
+            mode,
+        )
+
+    return "multilingual" if _is_env_enabled("ENABLE_TURN_DETECTOR", default=False) else "off"
+
+
+TURN_DETECTOR_MODE = _get_turn_detector_mode()
 
 
 class Assistant(Agent):
@@ -335,10 +355,18 @@ def get_resume_from_job_metadata(ctx: JobContext) -> str:
     return resume if isinstance(resume, str) else str(resume)
 
 
-def _build_turn_detection():
-    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+def _build_turn_detection(mode: str):
+    if mode == "english":
+        from livekit.plugins.turn_detector.english import EnglishModel
 
-    return MultilingualModel()
+        return EnglishModel()
+    if mode == "multilingual":
+        from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+        return MultilingualModel()
+    if mode == "stt":
+        return "stt"
+    return None
 
 
 @server.rtc_session(agent_name=AGENT_NAME)
@@ -350,6 +378,7 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
         "resume_metadata_present": bool(resume),
+        "turn_detector_mode": TURN_DETECTOR_MODE,
     }
 
     # Set up a voice AI pipeline using OpenAI, ElevenLabs, and Deepgram.
@@ -373,8 +402,9 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         "preemptive_generation": True,
     }
-    if ENABLE_TURN_DETECTOR:
-        session_kwargs["turn_detection"] = _build_turn_detection()
+    turn_detection = _build_turn_detection(TURN_DETECTOR_MODE)
+    if turn_detection is not None:
+        session_kwargs["turn_detection"] = turn_detection
 
     session = AgentSession(**session_kwargs)
 

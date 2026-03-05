@@ -23,5 +23,5 @@ services:
       - fromGroup: livekit-agent-secrets
       - key: AGENT_NAME
         value: my-agent
-      - key: ENABLE_TURN_DETECTOR
-        value: "false"
+      - key: TURN_DETECTOR_MODE
+        value: "english"
