@@ -14,7 +14,7 @@ services:
     runtime: docker
     plan: standard
     region: singapore
-    branch: Ahmed
+    branch: 05/03
     autoDeploy: true
     dockerfilePath: ./Dockerfile
     dockerContext: .
