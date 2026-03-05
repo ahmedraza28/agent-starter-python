@@ -460,7 +460,7 @@ Positioning power over process.
     #     return "sunny with a temperature of 70 degrees."
 
 
-server = AgentServer(num_idle_processes=1, load_threshold=0.98)
+server = AgentServer(num_idle_processes=0, load_threshold=0.98)
 
 
 def prewarm(proc: JobProcess):
