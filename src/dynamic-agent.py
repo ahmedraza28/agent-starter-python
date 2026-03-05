@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import logging
@@ -33,6 +34,79 @@ DYNAMIC_PROMPT_PROFILE = "dynamic"
 _MAIN_PROMPT_ASSISTANT_CLASS: type[Agent] | None = None
 
 
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s value '%s'. Falling back to %d.",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+
+RESUME_CHAR_LIMIT = max(256, _env_int("AGENT_RESUME_CHAR_LIMIT", 12000))
+MEMORY_LOG_INTERVAL_SEC = max(0, _env_int("AGENT_MEMORY_LOG_INTERVAL_SEC", 30))
+JOB_MEMORY_WARN_MB = max(256, _env_int("AGENT_JOB_MEMORY_WARN_MB", 1200))
+JOB_MEMORY_LIMIT_MB = max(512, _env_int("AGENT_JOB_MEMORY_LIMIT_MB", 1500))
+
+
+def truncate_resume_for_prompt(resume: str, *, limit: int = RESUME_CHAR_LIMIT) -> str:
+    cleaned = resume.strip()
+    if not cleaned:
+        return "No resume was provided."
+
+    if len(cleaned) <= limit:
+        return cleaned
+
+    return (
+        f"{cleaned[:limit].rstrip()}\n\n[Resume truncated to first {limit} characters.]"
+    )
+
+
+def _get_rss_mb() -> float | None:
+    status_path = Path("/proc/self/status")
+    if not status_path.exists():
+        return None
+
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) / 1024.0
+    except OSError:
+        return None
+
+    return None
+
+
+def log_memory_snapshot(stage: str, **fields: str | int | float | bool | None) -> None:
+    payload: dict[str, str | int | float | bool | None] = {"stage": stage}
+    rss_mb = _get_rss_mb()
+    if rss_mb is not None:
+        payload["rss_mb"] = round(rss_mb, 1)
+
+    payload.update(fields)
+    logger.info("memory_snapshot", extra=payload)
+
+
+async def _memory_heartbeat(room_name: str, prompt_profile: str) -> None:
+    while True:
+        await asyncio.sleep(MEMORY_LOG_INTERVAL_SEC)
+        log_memory_snapshot(
+            "heartbeat",
+            room=room_name,
+            prompt_profile=prompt_profile,
+        )
+
+
 def _load_main_prompt_assistant_class() -> type[Agent] | None:
     global _MAIN_PROMPT_ASSISTANT_CLASS
     if _MAIN_PROMPT_ASSISTANT_CLASS is not None:
@@ -62,7 +136,7 @@ def _load_main_prompt_assistant_class() -> type[Agent] | None:
 
 class Assistant(Agent):
     def __init__(self, resume: str = "") -> None:
-        resume_text = resume.strip() or "No resume was provided."
+        resume_text = truncate_resume_for_prompt(resume)
         super().__init__(
             instructions="""# Sally – Strategic Candidate Intelligence & Positioning Specialist (Sharp & Adaptive Version)
 
@@ -460,7 +534,12 @@ Positioning power over process.
     #     return "sunny with a temperature of 70 degrees."
 
 
-server = AgentServer(num_idle_processes=0, load_threshold=0.98)
+server = AgentServer(
+    num_idle_processes=0,
+    load_threshold=0.98,
+    job_memory_warn_mb=JOB_MEMORY_WARN_MB,
+    job_memory_limit_mb=JOB_MEMORY_LIMIT_MB,
+)
 
 
 def prewarm(proc: JobProcess):
@@ -517,6 +596,19 @@ async def my_agent(ctx: JobContext):
         "resume_metadata_present": bool(resume),
         "prompt_profile": prompt_profile,
     }
+    log_memory_snapshot(
+        "job_start",
+        room=ctx.room.name,
+        prompt_profile=prompt_profile,
+        resume_chars=len(resume),
+    )
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    if MEMORY_LOG_INTERVAL_SEC > 0:
+        heartbeat_task = asyncio.create_task(
+            _memory_heartbeat(ctx.room.name, prompt_profile),
+            name="memory-heartbeat",
+        )
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -531,7 +623,7 @@ async def my_agent(ctx: JobContext):
         tts=inference.TTS(
             model="elevenlabs/eleven_turbo_v2_5",
             voice="EXAVITQu4vr4xnSDxMaL",
-            language="en-US"
+            language="en-US",
         ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
@@ -540,6 +632,29 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
+
+    def _on_agent_state_changed(event) -> None:
+        log_memory_snapshot(
+            "agent_state_changed",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+            new_state=getattr(event, "new_state", "unknown"),
+        )
+
+    def _on_session_close(event) -> None:
+        reason = getattr(event, "reason", None)
+        reason_value = getattr(reason, "value", reason)
+        log_memory_snapshot(
+            "session_close",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+            reason=reason_value,
+        )
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+
+    session.on("agent_state_changed", _on_agent_state_changed)
+    session.on("close", _on_session_close)
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
@@ -573,24 +688,51 @@ async def my_agent(ctx: JobContext):
         else:
             selected_assistant = main_prompt_assistant_class(resume=resume)
 
-    await session.start(
-        agent=selected_assistant,
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
+    try:
+        await session.start(
+            agent=selected_assistant,
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(
+                    noise_cancellation=lambda params: (
+                        noise_cancellation.BVCTelephony()
+                        if params.participant.kind
+                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                        else noise_cancellation.BVC()
+                    ),
                 ),
             ),
-        ),
-    )
+        )
+        log_memory_snapshot(
+            "session_started",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+        )
 
-    # Join the room and connect to the user
-    await ctx.connect()
-    await session.generate_reply(instructions="Greet the user and offer your assistance.")
+        # Join the room and connect to the user
+        await ctx.connect()
+        log_memory_snapshot(
+            "room_connected",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+        )
+        await session.generate_reply(
+            instructions="Greet the user and offer your assistance."
+        )
+        log_memory_snapshot(
+            "initial_reply_generated",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+        )
+    except Exception:
+        log_memory_snapshot(
+            "job_error",
+            room=ctx.room.name,
+            prompt_profile=prompt_profile,
+        )
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        raise
 
 
 if __name__ == "__main__":
