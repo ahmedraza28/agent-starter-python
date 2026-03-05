@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -51,6 +52,20 @@ def _get_turn_detector_mode() -> str:
 
 
 TURN_DETECTOR_MODE = _get_turn_detector_mode()
+
+
+def _register_turn_detector_plugins_for_download() -> None:
+    # Ensure download-files command includes turn-detector model assets in the image.
+    if "download-files" not in sys.argv:
+        return
+
+    from livekit.plugins.turn_detector.english import EnglishModel
+    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+    _ = (EnglishModel, MultilingualModel)
+
+
+_register_turn_detector_plugins_for_download()
 
 
 class Assistant(Agent):
@@ -357,13 +372,25 @@ def get_resume_from_job_metadata(ctx: JobContext) -> str:
 
 def _build_turn_detection(mode: str):
     if mode == "english":
-        from livekit.plugins.turn_detector.english import EnglishModel
+        try:
+            from livekit.plugins.turn_detector.english import EnglishModel
 
-        return EnglishModel()
+            return EnglishModel()
+        except RuntimeError:
+            logger.exception(
+                "English turn detector model files unavailable. Falling back to STT turn detection."
+            )
+            return "stt"
     if mode == "multilingual":
-        from livekit.plugins.turn_detector.multilingual import MultilingualModel
+        try:
+            from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-        return MultilingualModel()
+            return MultilingualModel()
+        except RuntimeError:
+            logger.exception(
+                "Multilingual turn detector model files unavailable. Falling back to English turn detection."
+            )
+            return _build_turn_detection("english")
     if mode == "stt":
         return "stt"
     return None
