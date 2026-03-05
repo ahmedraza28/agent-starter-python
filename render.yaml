@@ -12,7 +12,7 @@ services:
   - type: worker
     name: candidate-agent
     runtime: docker
-    plan: starter
+    plan: standard
     region: singapore
     branch: Ahmed
     autoDeploy: true
