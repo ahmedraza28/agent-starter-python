@@ -64,18 +64,29 @@ def _get_turn_detector_mode() -> str:
 TURN_DETECTOR_MODE = _get_turn_detector_mode()
 
 
-def _register_turn_detector_plugins_for_download() -> None:
-    # Ensure download-files command includes turn-detector model assets in the image.
-    if "download-files" not in sys.argv:
+def _register_turn_detector_plugins() -> None:
+    is_download_files = "download-files" in sys.argv
+
+    if is_download_files:
+        # Ensure download-files command includes turn-detector model assets in the image.
+        from livekit.plugins.turn_detector.english import EnglishModel
+        from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+        _ = (EnglishModel, MultilingualModel)
         return
 
-    from livekit.plugins.turn_detector.english import EnglishModel
-    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+    # Register the chosen runner in the main process so the inference executor is started.
+    if TURN_DETECTOR_MODE == "english":
+        from livekit.plugins.turn_detector.english import EnglishModel
 
-    _ = (EnglishModel, MultilingualModel)
+        _ = EnglishModel
+    elif TURN_DETECTOR_MODE == "multilingual":
+        from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+        _ = MultilingualModel
 
 
-_register_turn_detector_plugins_for_download()
+_register_turn_detector_plugins()
 
 
 def _load_main_prompt_assistant_class() -> type[Agent] | None:
@@ -567,9 +578,9 @@ def _build_turn_detection(mode: str):
             return MultilingualModel()
         except RuntimeError:
             logger.exception(
-                "Multilingual turn detector model files unavailable. Falling back to English turn detection."
+                "Multilingual turn detector model files unavailable. Falling back to STT turn detection."
             )
-            return _build_turn_detection("english")
+            return "stt"
     if mode == "stt":
         return "stt"
     return None
