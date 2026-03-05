@@ -17,7 +17,6 @@ from livekit.agents import (
     room_io,
 )
 from livekit.plugins import noise_cancellation, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
 
@@ -31,6 +30,17 @@ AGENT_NAME = (
 DEFAULT_PROMPT_PROFILE = "main"
 DYNAMIC_PROMPT_PROFILE = "dynamic"
 _MAIN_PROMPT_ASSISTANT_CLASS: type[Agent] | None = None
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _is_env_enabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in _TRUE_VALUES
+
+
+ENABLE_TURN_DETECTOR = _is_env_enabled("ENABLE_TURN_DETECTOR", default=False)
 
 
 def _load_main_prompt_assistant_class() -> type[Agent] | None:
@@ -504,6 +514,12 @@ def get_prompt_profile_from_metadata(metadata: dict) -> str:
     return DEFAULT_PROMPT_PROFILE
 
 
+def _build_turn_detection():
+    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+    return MultilingualModel()
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: JobContext):
     metadata = get_job_metadata(ctx)
@@ -518,29 +534,31 @@ async def my_agent(ctx: JobContext):
         "prompt_profile": prompt_profile,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
-    session = AgentSession(
+    # Set up a voice AI pipeline using OpenAI, ElevenLabs, and Deepgram.
+    session_kwargs = {
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        "stt": inference.STT(model="deepgram/nova-3", language="multi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=inference.LLM(model="openai/gpt-5.1"),
+        "llm": inference.LLM(model="openai/gpt-5.1"),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
+        "tts": inference.TTS(
             model="elevenlabs/eleven_turbo_v2_5",
             voice="EXAVITQu4vr4xnSDxMaL",
-            language="en-US"
+            language="en-US",
         ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
+        # VAD is used to determine when the user is speaking.
+        "vad": ctx.proc.userdata["vad"],
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
-    )
+        "preemptive_generation": True,
+    }
+    if ENABLE_TURN_DETECTOR:
+        session_kwargs["turn_detection"] = _build_turn_detection()
+
+    session = AgentSession(**session_kwargs)
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
